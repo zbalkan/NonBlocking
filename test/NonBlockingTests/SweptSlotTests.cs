@@ -72,6 +72,10 @@ namespace NonBlockingTests
         // value TOMBPRIME, key and hash still set, no new table.
         private static (object Table, int Hash) SweepSlot(NonBlocking.ConcurrentDictionary<string, object> d)
         {
+            // A removal arms the real sweeper, which runs after the next garbage collection and
+            // would clear the slot under the test. A pending request keeps SweepCheck from arming it.
+            FindField(d.GetType(), "_sweepRequests").SetValue(d, 1);
+
             d[Key] = "old";
             Assert.True(d.TryRemove(Key, out _));
 
