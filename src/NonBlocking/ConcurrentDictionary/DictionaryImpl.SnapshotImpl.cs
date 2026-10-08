@@ -5,6 +5,7 @@
 #nullable disable
 
 using System.Runtime.CompilerServices;
+using System.Threading;
 
 namespace NonBlocking
 {
@@ -42,25 +43,35 @@ namespace NonBlocking
                 var entries = this._table._entries;
                 while (_idx < entries.Length)
                 {
-                    var nextEntry = entries[_idx++];
+                    ref var nextEntry = ref entries[_idx++];
 
-                    if (nextEntry.value != null)
+                    // The value is CAS-ed in after the key, so a non-null value implies the key is visible.
+                    object nextV = Volatile.Read(ref nextEntry.value);
+                    if (nextV == null || nextV == TOMBSTONE)
                     {
-                        var nextKstore = nextEntry.key;
-                        if (nextKstore == null)
+                        continue;
+                    }
+
+                    var nextKstore = nextEntry.key;
+                    if (nextKstore == null)
+                    {
+                        // slot was deleted and swept.
+                        continue;
+                    }
+
+                    _curKey = _table.keyFromEntry(nextKstore);
+                    if (nextV is Prime)
+                    {
+                        // a copy or sweep is in progress: resolve through the table, which follows forwarding.
+                        nextV = _table.TryGetValue(_curKey);
+                        if (nextV == null)
                         {
-                            // slot was deleted.
                             continue;
                         }
-
-                        _curKey = _table.keyFromEntry(nextKstore);
-                        object nextV = _table.TryGetValue(_curKey);
-                        if (nextV != null)
-                        {
-                            _curValue = _table.FromObjectValue(nextV);
-                            return true;
-                        }
                     }
+
+                    _curValue = _table.FromObjectValue(nextV);
+                    return true;
                 }
 
                 _curKey = default;
