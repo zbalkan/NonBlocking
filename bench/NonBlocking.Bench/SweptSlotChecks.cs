@@ -77,6 +77,10 @@ internal static class SweptSlotChecks
     /// <summary>Adds and removes the key, then leaves its slot as the sweeper does mid-way.</summary>
     private static (object Table, int Hash) Sweep(ConcurrentDictionary<string, object> d)
     {
+        // A removal arms the real sweeper, which runs after the next garbage collection and would
+        // clear the slot under the check. A pending request keeps SweepCheck from arming it.
+        FindField(d.GetType(), "_sweepRequests").SetValue(d, 1);
+
         d[Key] = "old";
         d.TryRemove(Key, out _);
         object table = FindField(d.GetType(), "_table").GetValue(d)!;
