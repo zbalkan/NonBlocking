@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Same GC mode as BenchmarksCore, so numbers are comparable with the existing harness. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Relative path on purpose: the workflow copies bench/ into a baseline checkout
+         so the same harness builds against that checkout's src/. -->
+    <ProjectReference Include="..\..\src\NonBlocking\NonBlocking.csproj" />
+  </ItemGroup>
+
+</Project>
