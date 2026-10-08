@@ -1,0 +1,224 @@
+name: Multi-core benchmark
+
+# Correctness stress on x64 and ARM64, then a throughput benchmark comparing this commit with a
+# baseline and with System.Collections.Concurrent.ConcurrentDictionary.
+#
+# Runners: free standard GitHub-hosted runners only (4 vCPUs each on public repositories).
+# Every job runs on x64 and ARM64. With 4 cores the thread sweep is 1, 2, 4 and 8, the last
+# deliberately oversubscribed (lookup-only scenarios stop at 4); effects smaller than the
+# run-to-run noise (roughly 10-15% on shared runners) will be reported as "no clear difference".
+#
+# The benchmark is split into four shards per architecture that run in parallel. Scenarios go
+# to shards in groups of tables meant to be read together (run_bench.py GROUPS), each with all
+# its series and trials, so every comparison, within a table or within a group, is made on one
+# machine. A merge job per architecture combines the shards into one summary. Stress runs
+# alongside the benchmark rather than before it; a stress failure still fails the workflow.
+
+on:
+  push:
+    branches: [ main, 'bench/**', 'perf/**' ]
+    paths:
+      - 'src/**'
+      - 'bench/**'
+      - '.github/workflows/multicore-bench.yml'
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: 'Ref to compare against (branch, tag or SHA). Empty: compare with BCL only.'
+        required: false
+        default: ''
+      trials:
+        description: 'Trials per series (>= 6 for significance at every thread count)'
+        required: false
+        default: '7'
+      duration_ms:
+        description: 'Measured milliseconds per thread count'
+        required: false
+        default: '1000'
+      scenarios:
+        description: 'Comma-separated scenarios, or all'
+        required: false
+        default: 'all'
+      stress_seconds:
+        description: 'Seconds per stress run'
+        required: false
+        default: '120'
+
+permissions:
+  contents: read
+
+# No concurrency group: GitHub keeps at most one pending run per group and replaces it when
+# another push arrives, which would silently drop comparisons. Each push compares against its
+# own baseline, and hosted runners are separate VMs, so overlapping runs do not interfere.
+
+env:
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+  DOTNET_VERSION: '10.0.x'
+
+jobs:
+  stress:
+    name: stress (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # ARM64 has a weaker memory model than x64; ordering bugs in the lock-free paths
+        # tend to appear there first.
+        os: [ ubuntu-latest, ubuntu-24.04-arm ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Build
+        run: dotnet build bench/NonBlocking.Bench -c Release -o out/head
+
+      - name: Stress
+        env:
+          STRESS_SECONDS: ${{ inputs.stress_seconds || '120' }}
+        run: |
+          cores=$(nproc)
+          echo "Detected CPU cores: ${cores}"
+          # Oversubscribe so threads are preempted mid-operation, which is where
+          # non-blocking algorithms differ from lock-based ones.
+          dotnet out/head/NonBlocking.Bench.dll stress --seconds "${STRESS_SECONDS}" --threads $(( cores * 2 ))
+
+  bench:
+    name: bench (${{ matrix.os }}, shard ${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, ubuntu-24.04-arm ]
+        shard: [ 0, 1, 2, 3 ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      SHARDS: '4'
+      SHARD: ${{ matrix.shard }}
+      # On push, compare with the previous tip of the branch, or with main when the branch is
+      # new; on dispatch, with the requested ref.
+      BASELINE_REF: ${{ inputs.baseline_ref || (github.event_name == 'push' && (github.event.before != '0000000000000000000000000000000000000000' && github.event.before || 'main')) || '' }}
+      TRIALS: ${{ inputs.trials || '7' }}
+      DURATION_MS: ${{ inputs.duration_ms || '1000' }}
+      SCENARIOS: ${{ inputs.scenarios || 'all' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: head
+          # Full history, so the baseline can be any branch, tag or (short) commit ID.
+          fetch-depth: 0
+
+      - name: Check out baseline
+        if: env.BASELINE_REF != ''
+        run: |
+          if [[ ! "${BASELINE_REF}" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ ]]; then
+            echo "::error::baseline_ref '${BASELINE_REF}' is not a valid ref name or commit ID"
+            exit 1
+          fi
+          resolve() { git -C head rev-parse --verify --quiet "$1^{commit}"; }
+          # A local name or commit ID first, then a remote branch, then a fetch by name or full
+          # commit ID (for a push whose previous tip is no longer on any branch).
+          sha=$(resolve "${BASELINE_REF}") \
+            || sha=$(resolve "origin/${BASELINE_REF}") \
+            || { git -C head fetch --quiet --no-tags origin "${BASELINE_REF}" && sha=$(resolve FETCH_HEAD); } \
+            || { echo "::error::cannot resolve baseline_ref '${BASELINE_REF}'"; exit 1; }
+          git -C head worktree add --detach ../base "${sha}"
+          echo "Baseline ${BASELINE_REF} resolved to ${sha}"
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Build
+        run: |
+          dotnet build head/bench/NonBlocking.Bench -c Release -o out/head
+          if [ -d base ]; then
+            # Same harness source for both builds; only src/ differs.
+            rm -rf base/bench
+            cp -r head/bench base/bench
+            dotnet build base/bench/NonBlocking.Bench -c Release -o out/base
+          fi
+
+      - name: Benchmark
+        run: |
+          echo "Detected CPU cores: $(nproc)"
+          variants=(--variant head=out/head/NonBlocking.Bench.dll)
+          if [ -d base ]; then
+            variants+=(--variant base=out/base/NonBlocking.Bench.dll)
+          fi
+          python3 head/bench/run_bench.py "${variants[@]}" --shard "${SHARD}/${SHARDS}" \
+            --trials "${TRIALS}" --duration-ms "${DURATION_MS}" --scenarios "${SCENARIOS}" \
+            --out bench-results.jsonl --summary bench-summary.md
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-${{ matrix.os }}-shard${{ matrix.shard }}-${{ github.sha }}
+          path: bench-results.jsonl
+          if-no-files-found: warn
+          # A re-run of a failed shard replaces its earlier upload instead of failing.
+          overwrite: true
+
+  summary:
+    name: summary (${{ matrix.os }})
+    needs: bench
+    # Summarise whatever the shards produced, so a failed shard still leaves the others' tables.
+    if: always()
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, ubuntu-24.04-arm ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ARCH_RUNNER: ${{ matrix.os }}
+      BASELINE_REF: ${{ inputs.baseline_ref || (github.event_name == 'push' && (github.event.before != '0000000000000000000000000000000000000000' && github.event.before || 'main')) || '' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: bench/run_bench.py
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: bench-${{ matrix.os }}-shard*-${{ github.sha }}
+          path: shards
+
+      - name: Merge shards
+        run: |
+          mapfile -t files < <(find shards -name bench-results.jsonl | sort)
+          echo "Found ${#files[@]} shard result file(s)"
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no shard produced results"
+            exit 1
+          fi
+          status=0
+          python3 bench/run_bench.py --merge "${files[@]}" --summary bench-summary.md > /dev/null || status=$?
+          if [ -f bench-summary.md ]; then
+            {
+              echo "Architecture: \`${ARCH_RUNNER}\`, shards merged: ${#files[@]} of 4, baseline: \`${BASELINE_REF:-none}\`"
+              echo
+              cat bench-summary.md
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          if [ "${#files[@]}" -ne 4 ]; then
+            echo "::error::only ${#files[@]} of 4 shards produced results"
+            status=1
+          fi
+          exit "${status}"
+
+      - name: Upload merged results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            shards
+            bench-summary.md
+          if-no-files-found: warn
+          overwrite: true
