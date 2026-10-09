@@ -542,7 +542,8 @@ def annotations(findings: list[dict], label: str, cand: str, base: str) -> list[
         if not sig:
             unchanged.append(scenario)
             continue
-        worse = [f for f in sig if f["ratio"] < 1]
+        # Same rule as fmt_ratio: a significant ratio of exactly 1 is reported as slower.
+        worse = [f for f in sig if f["ratio"] <= 1]
         group, kind = (worse, "warning") if worse else (sig, "notice")
         (slower if worse else faster).append(scenario)
         ratios = [f["ratio"] for f in group]

@@ -19,6 +19,8 @@ internal sealed class ThroughputRun
     private const int Stop = 2;
 
     private volatile int _phase = Warmup;
+    private long _warmupStart;
+    private long _measureStart;
     private readonly long[] _counts;
     private readonly long[] _aux;
 
@@ -31,6 +33,13 @@ internal sealed class ThroughputRun
     public bool Stopped => _phase == Stop;
 
     public bool Measuring => _phase == Measure;
+
+    /// <summary>
+    /// <see cref="Stopwatch.GetTimestamp"/> at the start of the current phase: the warm-up while
+    /// warming up, the measured window once <see cref="Measuring"/> is set. Workloads that change
+    /// over time key off this, so every implementation runs the same schedule in the window.
+    /// </summary>
+    public long PhaseStart => Measuring ? Volatile.Read(ref _measureStart) : Volatile.Read(ref _warmupStart);
 
     /// <summary>Workers call this once, after leaving their loop, with their own totals.</summary>
     public void Report(int threadId, long measuredOps, long auxiliary = 0)
@@ -61,10 +70,13 @@ internal sealed class ThroughputRun
         }
 
         ready.Wait();
+        run._warmupStart = Stopwatch.GetTimestamp();
         go.Set();
         Thread.Sleep(settings.WarmupMs);
 
         var sw = Stopwatch.StartNew();
+        // Written before the phase flips; the volatile write of _phase publishes it.
+        run._measureStart = Stopwatch.GetTimestamp();
         run._phase = Measure;
         Thread.Sleep(settings.DurationMs);
         run._phase = Stop;

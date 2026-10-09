@@ -347,35 +347,38 @@ internal readonly struct ChurnLongScenario(string name, string impl, int threads
 }
 
 /// <summary>
-/// Unique long keys with a live set that alternates between a small and a 100x larger size every
-/// <see cref="PhaseIterations"/> iterations per thread. A resize policy must grow for the burst and
-/// shrink afterwards; one that sizes from the live count too eagerly pays for repeated regrowth,
-/// and one that never shrinks keeps the burst's memory.
+/// Unique long keys with a live set that alternates between a small and a 100x larger size. A
+/// resize policy must grow for the burst and shrink afterwards; one that sizes from the live
+/// count too eagerly pays for repeated regrowth, and one that never shrinks keeps the burst's
+/// memory. Phases follow the clock, a quarter of --duration-ms each, restarting when measurement
+/// starts, so every implementation measures the same two complete small/large cycles whatever
+/// its speed. Counting phases in iterations would let a faster table run more of them.
 /// </summary>
 internal readonly struct ChurnBurstScenario(string name, string impl, int threads, RunSettings s)
     : IMapConsumer<long, object, Measurement>
 {
     private const int BurstFactor = 100;
-    private const int PhaseIterations = 1 << 18;
 
     public Measurement Consume<TMap>(TMap map) where TMap : struct, IMap<long, object>
     {
         long before = GC.GetTotalMemory(forceFullCollection: true);
         int small = Math.Max(1, s.Live / threads);
         int large = small * BurstFactor;
+        long phaseTicks = Math.Max(1, Stopwatch.Frequency * s.DurationMs / 4000);
 
         var result = ThroughputRun.Execute(name, impl, threads, s, (tid, run) =>
         {
             var window = new Queue<long>(large + 1);
             // Thread id in the top bits keeps keys unique across threads; n never reaches 2^40.
-            long n = ((long)tid << 40) + 1, ops = 0, iterations = 0;
+            long n = ((long)tid << 40) + 1, ops = 0;
             while (!run.Stopped)
             {
                 bool measuring = run.Measuring;
                 int batchOps = 0;
+                // Sampled once per batch, like the measuring flag, to keep the clock off the inner loop.
+                int target = (((Stopwatch.GetTimestamp() - run.PhaseStart) / phaseTicks) & 1) == 0 ? small : large;
                 for (int b = 0; b < ThroughputRun.Batch / 2; b++)
                 {
-                    int target = ((iterations++ / PhaseIterations) & 1) == 0 ? small : large;
                     if (window.Count <= target)
                     {
                         long key = n++;
