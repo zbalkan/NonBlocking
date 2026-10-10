@@ -5,6 +5,7 @@
 #nullable disable
 
 using System.Runtime.CompilerServices;
+using System.Threading;
 
 namespace NonBlocking
 {
@@ -42,25 +43,48 @@ namespace NonBlocking
                 var entries = this._table._entries;
                 while (_idx < entries.Length)
                 {
-                    var nextEntry = entries[_idx++];
+                    ref var nextEntry = ref entries[_idx++];
 
-                    if (nextEntry.value != null)
+                    // An insert writes the key before it CASes in a live value, so the value must be
+                    // read first: a copy of the whole entry can pair a new value with the key from
+                    // before the insert wrote it.
+                    object nextV = Volatile.Read(ref nextEntry.value);
+                    if (nextV == null || nextV == TOMBSTONE)
                     {
-                        var nextKstore = nextEntry.key;
-                        if (nextKstore == null)
+                        continue;
+                    }
+
+                    var nextKstore = nextEntry.key;
+                    if (nextKstore == null)
+                    {
+                        // slot was deleted.
+                        continue;
+                    }
+
+                    _curKey = _table.keyFromEntry(nextKstore);
+                    if (nextV is Prime)
+                    {
+                        // A copy writes TOMBPRIME over a slot with no value, which can be a slot an
+                        // insert has claimed by its hash but not yet given a key. Its key then reads
+                        // as the empty key: 0 for integer keys, which the lookup below would resolve
+                        // to a real key 0 stored elsewhere. The hash is written before the key, so a
+                        // key that does not match the slot's hash was never written to this slot.
+                        if (nextV == TOMBPRIME && nextEntry.hash != _table.hash(_curKey))
                         {
-                            // slot was deleted.
                             continue;
                         }
 
-                        _curKey = _table.keyFromEntry(nextKstore);
-                        object nextV = _table.TryGetValue(_curKey);
-                        if (nextV != null)
+                        // A copy or sweep is in progress: resolve through a lookup, which follows
+                        // forwarding to the newer table.
+                        nextV = _table.TryGetValue(_curKey);
+                        if (nextV == null)
                         {
-                            _curValue = _table.FromObjectValue(nextV);
-                            return true;
+                            continue;
                         }
                     }
+
+                    _curValue = _table.FromObjectValue(nextV);
+                    return true;
                 }
 
                 _curKey = default;
