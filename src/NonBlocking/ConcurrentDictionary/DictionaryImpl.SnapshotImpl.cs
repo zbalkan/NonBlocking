@@ -49,17 +49,21 @@ namespace NonBlocking
                     // read first: a copy of the whole entry can pair a new value with the key from
                     // before the insert wrote it.
                     object nextV = Volatile.Read(ref nextEntry.value);
-                    if (nextV != null)
+                    if (nextV == null || nextV == TOMBSTONE)
                     {
-                        var nextKstore = nextEntry.key;
-                        if (nextKstore == null)
-                        {
-                            // slot was deleted.
-                            continue;
-                        }
+                        continue;
+                    }
 
-                        _curKey = _table.keyFromEntry(nextKstore);
+                    var nextKstore = nextEntry.key;
+                    if (nextKstore == null)
+                    {
+                        // slot was deleted.
+                        continue;
+                    }
 
+                    _curKey = _table.keyFromEntry(nextKstore);
+                    if (nextV is Prime)
+                    {
                         // A copy writes TOMBPRIME over a slot with no value, which can be a slot an
                         // insert has claimed by its hash but not yet given a key. Its key then reads
                         // as the empty key: 0 for integer keys, which the lookup below would resolve
@@ -70,13 +74,17 @@ namespace NonBlocking
                             continue;
                         }
 
-                        object value = _table.TryGetValue(_curKey);
-                        if (value != null)
+                        // A copy or sweep is in progress: resolve through a lookup, which follows
+                        // forwarding to the newer table.
+                        nextV = _table.TryGetValue(_curKey);
+                        if (nextV == null)
                         {
-                            _curValue = _table.FromObjectValue(value);
-                            return true;
+                            continue;
                         }
                     }
+
+                    _curValue = _table.FromObjectValue(nextV);
+                    return true;
                 }
 
                 _curKey = default;
