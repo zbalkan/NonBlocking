@@ -4,6 +4,7 @@
 
 #nullable disable
 
+using System;
 using System.Runtime.CompilerServices;
 using System.Threading;
 
@@ -34,12 +35,50 @@ namespace NonBlocking
                     _table.HelpCopy(copy_all: true);
                     this._table = (DictionaryImpl<TKey, TKeyStore, TValue>)this._table._topDict._table;
                 }
+
+                // Keeps the sweeper from retiring slots of this table until Dispose, the end of the
+                // enumeration or the generation expires. The count is updated with a
+                // compare-exchange, a full fence, which the sweeper's check relies on.
+                _counted = this._table.TryOpenEnumeration(out _generation);
+            }
+
+            // Whether this enumeration is counted, and in which generation.
+            private bool _counted;
+            private int _generation;
+
+            private void Release()
+            {
+                if (_counted)
+                {
+                    _counted = false;
+                    this._table.CloseEnumeration(_generation);
+                }
+            }
+
+            public override void Dispose() => Release();
+
+            // Moves the count to the newest generation, so that an enumeration in use is not left
+            // in one the sweeper is about to drop. The new count is taken before the old one is
+            // given up, so the enumeration counts throughout.
+            private void Renew()
+            {
+                if (this._table.TryOpenEnumeration(out int generation))
+                {
+                    int old = _generation;
+                    _generation = generation;
+                    this._table.CloseEnumeration(old);
+                }
             }
 
             public override int Count => _table.Count;
 
             public override bool MoveNext()
             {
+                if (_counted && Volatile.Read(ref this._table._enumerationGeneration) != _generation)
+                {
+                    Renew();
+                }
+
                 var entries = this._table._entries;
                 while (_idx < entries.Length)
                 {
@@ -89,11 +128,15 @@ namespace NonBlocking
 
                 _curKey = default;
                 _curValue = default;
+                Release();
                 return false;
             }
 
             public override void Reset()
             {
+                Release();
+                _counted = this._table.TryOpenEnumeration(out _generation);
+
                 _idx = 0;
                 _curKey = default;
                 _curValue = default;
