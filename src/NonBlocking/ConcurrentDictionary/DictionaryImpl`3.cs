@@ -1418,31 +1418,25 @@ namespace NonBlocking
                 // after removing.
                 Interlocked.Exchange(ref dict._topDict._sweepRequests, 0);
 
-                var entries = dict._entries;
-                for (int i = 0; i < entries.Length; i++)
+                // Retire removed keys by copying the table instead of clearing their slots in
+                // place. A cleared slot can never be used again, so a key added back after the
+                // sweep would take another slot of the same table, and an enumeration already
+                // running over that table would yield the key twice. A copy leaves the old table
+                // as it is: an enumeration that started on it visits each key's old slot once,
+                // and the removed keys are released together with the old table.
+                // The request may come from a table that a resize or Clear has since replaced, so
+                // work on the current one. If a resize is in progress, it copies the table anyway:
+                // help it. Otherwise copy only when there is a removed key to retire.
+                dict = (DictionaryImpl<TKey, TKeyStore, TValue>)dict._topDict._table;
+                if (dict._newTable == null && HasTombstones(dict._entries))
                 {
-                    // if resizing, just help to resize instead
-                    if (dict._newTable != null)
-                    {
-                        do
-                        {
-                            dict.HelpCopy(copy_all: true);
-                            dict = dict._newTable;
-                        } while (dict._newTable != null);
-                        break;
-                    }
+                    Interlocked.CompareExchange(ref dict._newTable, dict.CreateNew(dict._entries.Length), null);
+                }
 
-                    ref var e = ref entries[i];
-                    if (e.value == TOMBSTONE)
-                    {
-                        if (Interlocked.CompareExchange(ref e.value, TOMBPRIME, TOMBSTONE) == TOMBSTONE)
-                        {
-                            e.hash = SPECIAL_HASH_BITS;
-                            e.key = default(TKeyStore);
-                            Interlocked.Increment(ref dict._copyDone);
-                        }
-                    }
-
+                while (dict._newTable != null)
+                {
+                    dict.HelpCopy(copy_all: true);
+                    dict = dict._newTable;
                 }
 
                 // got new requests while sweeping. revisit after next GC.
@@ -1451,6 +1445,19 @@ namespace NonBlocking
                 {
                     TryRearm(dict);
                 }
+            }
+
+            private static bool HasTombstones(Entry[] entries)
+            {
+                for (int i = 0; i < entries.Length; i++)
+                {
+                    if (entries[i].value == TOMBSTONE)
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
             }
         }
     }
