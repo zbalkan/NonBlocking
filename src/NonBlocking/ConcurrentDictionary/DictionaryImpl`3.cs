@@ -1430,7 +1430,10 @@ namespace NonBlocking
                 dict = (DictionaryImpl<TKey, TKeyStore, TValue>)dict._topDict._table;
                 if (dict._newTable == null && HasTombstones(dict._entries))
                 {
-                    Interlocked.CompareExchange(ref dict._newTable, dict.CreateNew(dict._entries.Length), null);
+                    // Size the copy from the live count, as a resize does, so retiring removed keys
+                    // also returns the memory their slots took; never larger than the old table.
+                    int capacity = Math.Min(dict._entries.Length, Math.Max(MIN_SIZE, dict.Size * 4));
+                    Interlocked.CompareExchange(ref dict._newTable, dict.CreateNew(capacity), null);
                 }
 
                 while (dict._newTable != null)
