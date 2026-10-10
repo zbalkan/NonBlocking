@@ -1,7 +1,8 @@
 name: Multi-core benchmark
 
-# Correctness stress on x64 and ARM64, then a throughput benchmark comparing this commit with a
-# baseline and with System.Collections.Concurrent.ConcurrentDictionary.
+# Correctness stress and the enumeration and swept-slot tests on x64 and ARM64, then a
+# throughput benchmark comparing this commit with a baseline and with
+# System.Collections.Concurrent.ConcurrentDictionary.
 #
 # Runners: free standard GitHub-hosted runners only (4 vCPUs each on public repositories).
 # Every job runs on x64 and ARM64. With 4 cores the thread sweep is 1, 2, 4 and 8, the last
@@ -90,6 +91,32 @@ jobs:
           # Oversubscribe so threads are preempted mid-operation, which is where
           # non-blocking algorithms differ from lock-based ones.
           dotnet out/head/NonBlocking.Bench.dll stress --seconds "${STRESS_SECONDS}" --threads $(( cores * 2 ))
+
+  tests:
+    name: tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, ubuntu-24.04-arm ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # The test project targets net6.0 and net7.0; the newest of the two is enough here.
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: |
+            7.0.x
+            ${{ env.DOTNET_VERSION }}
+
+      # The enumeration and swept-slot tests. The remaining suite runs long loops that
+      # the free runners do not need to repeat on every push.
+      - name: Test
+        run: >
+          dotnet test test/NonBlockingTests -c Release -f net7.0
+          --filter "FullyQualifiedName~EnumerationTests|FullyQualifiedName~SweptSlotTests"
+          --logger "console;verbosity=normal"
 
   bench:
     name: bench (${{ matrix.os }}, shard ${{ matrix.shard }})
