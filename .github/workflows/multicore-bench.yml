@@ -1,0 +1,278 @@
+name: Multi-core benchmark
+
+# Correctness stress and unit tests on x64 and ARM64, then a throughput benchmark comparing a head
+# with a baseline and with System.Collections.Concurrent.ConcurrentDictionary.
+#
+# The harness (bench/ and this workflow) lives on its own branch. Every job takes src/ and test/
+# from head_ref and baseline_ref and builds them with this branch's harness, so a change under
+# test needs no harness commits of its own. with_refs stacks unmerged changes the measured one
+# depends on onto both sides.
+#
+# Runners: free standard GitHub-hosted runners only (4 vCPUs each on public repositories).
+# Every job runs on x64 and ARM64. With 4 cores the thread sweep is 1, 2, 4 and 8, the last
+# deliberately oversubscribed (lookup-only scenarios stop at 4); effects smaller than the
+# run-to-run noise (roughly 10-15% on shared runners) will be reported as "no clear difference".
+#
+# The benchmark is split into four shards per architecture that run in parallel. Scenarios go
+# to shards in groups of tables meant to be read together (run_bench.py GROUPS), each with all
+# its series and trials, so every comparison, within a table or within a group, is made on one
+# machine. A merge job per architecture combines the shards into one summary. Stress runs
+# alongside the benchmark rather than before it; a stress failure still fails the workflow.
+
+on:
+  # Dispatch only: a push here would measure main, which fails the stress swept-slot checks
+  # until fix/swept-slot-null-table is merged.
+  workflow_dispatch:
+    inputs:
+      head_ref:
+        description: 'Ref to measure (branch, tag or SHA). Empty: this commit.'
+        required: false
+        default: ''
+      with_refs:
+        description: 'Space-separated refs merged into both head and baseline, e.g. fix/swept-slot-null-table, which the stress swept-slot checks need until it is merged'
+        required: false
+        default: ''
+      baseline_ref:
+        description: 'Ref to compare against (branch, tag or SHA). Empty: compare with BCL only.'
+        required: false
+        default: ''
+      trials:
+        description: 'Trials per series (>= 6 for significance at every thread count)'
+        required: false
+        default: '7'
+      duration_ms:
+        description: 'Measured milliseconds per thread count'
+        required: false
+        default: '1000'
+      scenarios:
+        description: 'Comma-separated scenarios, or all'
+        required: false
+        default: 'all'
+      live:
+        description: 'Live keys per churn scenario (churn-str, churn-long; churn-burst swings to 100x)'
+        required: false
+        default: '1000'
+      stress_seconds:
+        description: 'Seconds per stress run'
+        required: false
+        default: '120'
+      tests_filter:
+        description: 'dotnet test filter for the unit tests'
+        required: false
+        default: 'FullyQualifiedName~EnumerationTests|FullyQualifiedName~SweptSlotTests|FullyQualifiedName~SweepTests'
+
+permissions:
+  contents: read
+
+# No concurrency group: GitHub keeps at most one pending run per group and replaces it when
+# another run is queued, which would silently drop comparisons. Hosted runners are separate VMs,
+# so overlapping runs do not interfere.
+
+env:
+  DOTNET_NOLOGO: 'true'
+  HEAD_REF: ${{ inputs.head_ref || github.sha }}
+  WITH_REFS: ${{ inputs.with_refs || '' }}
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+  DOTNET_VERSION: '10.0.x'
+
+jobs:
+  stress:
+    name: stress (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # ARM64 has a weaker memory model than x64; ordering bugs in the lock-free paths
+        # tend to appear there first.
+        os: [ ubuntu-latest, ubuntu-24.04-arm ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: harness
+          # Full history, so head, baseline and stacked refs can be any branch, tag or commit ID.
+          fetch-depth: 0
+
+      - name: Check out head
+        run: bash harness/bench/checkout-ref.sh harness "${HEAD_REF}" head ${WITH_REFS}
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Build
+        run: dotnet build head/bench/NonBlocking.Bench -c Release -o out/head
+
+      - name: Stress
+        env:
+          STRESS_SECONDS: ${{ inputs.stress_seconds || '120' }}
+        run: |
+          cores=$(nproc)
+          echo "Detected CPU cores: ${cores}"
+          # Oversubscribe so threads are preempted mid-operation, which is where
+          # non-blocking algorithms differ from lock-based ones.
+          dotnet out/head/NonBlocking.Bench.dll stress --seconds "${STRESS_SECONDS}" --threads $(( cores * 2 ))
+
+  tests:
+    name: tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, ubuntu-24.04-arm ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      TESTS_FILTER: ${{ inputs.tests_filter || 'FullyQualifiedName~EnumerationTests|FullyQualifiedName~SweptSlotTests|FullyQualifiedName~SweepTests' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: harness
+          # Full history, so head, baseline and stacked refs can be any branch, tag or commit ID.
+          fetch-depth: 0
+
+      - name: Check out head
+        run: bash harness/bench/checkout-ref.sh harness "${HEAD_REF}" head ${WITH_REFS}
+
+      # The test project targets net6.0 and net7.0; the newest of the two is enough here.
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: |
+            7.0.x
+            ${{ env.DOTNET_VERSION }}
+
+      # The head's own tests, filtered: the rest of the suite runs long loops that the free
+      # runners do not need to repeat. A filter that selects no test fails the job, since a
+      # green run would otherwise mean nothing; set tests_filter for a head without these tests.
+      - name: Test
+        run: |
+          set -o pipefail
+          dotnet test head/test/NonBlockingTests -c Release -f net7.0 \
+            --filter "${TESTS_FILTER}" --logger "console;verbosity=normal" | tee test.log
+          if grep -q "No test matches the given testcase filter" test.log; then
+            echo "::error::tests_filter '${TESTS_FILTER}' selects no test in ${HEAD_REF}"
+            exit 1
+          fi
+
+  bench:
+    name: bench (${{ matrix.os }}, shard ${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, ubuntu-24.04-arm ]
+        shard: [ 0, 1, 2, 3 ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      SHARDS: '4'
+      SHARD: ${{ matrix.shard }}
+      BASELINE_REF: ${{ inputs.baseline_ref || '' }}
+      TRIALS: ${{ inputs.trials || '7' }}
+      DURATION_MS: ${{ inputs.duration_ms || '1000' }}
+      SCENARIOS: ${{ inputs.scenarios || 'all' }}
+      LIVE: ${{ inputs.live || '1000' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: harness
+          # Full history, so head, baseline and stacked refs can be any branch, tag or commit ID.
+          fetch-depth: 0
+
+      - name: Check out head
+        run: bash harness/bench/checkout-ref.sh harness "${HEAD_REF}" head ${WITH_REFS}
+
+      - name: Check out baseline
+        if: env.BASELINE_REF != ''
+        run: bash harness/bench/checkout-ref.sh harness "${BASELINE_REF}" base ${WITH_REFS}
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Build
+        run: |
+          # Both carry this branch's harness (checkout-ref.sh); only src/ differs.
+          dotnet build head/bench/NonBlocking.Bench -c Release -o out/head
+          if [ -d base ]; then
+            dotnet build base/bench/NonBlocking.Bench -c Release -o out/base
+          fi
+
+      - name: Benchmark
+        run: |
+          echo "Detected CPU cores: $(nproc)"
+          variants=(--variant head=out/head/NonBlocking.Bench.dll)
+          if [ -d base ]; then
+            variants+=(--variant base=out/base/NonBlocking.Bench.dll)
+          fi
+          python3 harness/bench/run_bench.py "${variants[@]}" --shard "${SHARD}/${SHARDS}" \
+            --trials "${TRIALS}" --duration-ms "${DURATION_MS}" --scenarios "${SCENARIOS}" --live "${LIVE}" \
+            --out bench-results.jsonl --summary bench-summary.md
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-${{ matrix.os }}-shard${{ matrix.shard }}-${{ github.sha }}
+          path: bench-results.jsonl
+          if-no-files-found: warn
+          # A re-run of a failed shard replaces its earlier upload instead of failing.
+          overwrite: true
+
+  summary:
+    name: summary (${{ matrix.os }})
+    needs: bench
+    # Summarise whatever the shards produced, so a failed shard still leaves the others' tables.
+    if: always()
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, ubuntu-24.04-arm ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ARCH_RUNNER: ${{ matrix.os }}
+      BASELINE_REF: ${{ inputs.baseline_ref || '' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: bench/run_bench.py
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: bench-${{ matrix.os }}-shard*-${{ github.sha }}
+          path: shards
+
+      - name: Merge shards
+        run: |
+          mapfile -t files < <(find shards -name bench-results.jsonl | sort)
+          echo "Found ${#files[@]} shard result file(s)"
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no shard produced results"
+            exit 1
+          fi
+          status=0
+          # One ::notice/::warning line per significant head/base table, shown on the run page.
+          python3 bench/run_bench.py --merge "${files[@]}" --summary bench-summary.md --annotate "${ARCH_RUNNER}" || status=$?
+          if [ -f bench-summary.md ]; then
+            {
+              echo "Architecture: \`${ARCH_RUNNER}\`, shards merged: ${#files[@]} of 4, head: \`${HEAD_REF}\`, baseline: \`${BASELINE_REF:-none}\`, stacked: \`${WITH_REFS:-none}\`"
+              echo
+              cat bench-summary.md
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          if [ "${#files[@]}" -ne 4 ]; then
+            echo "::error::only ${#files[@]} of 4 shards produced results"
+            status=1
+          fi
+          exit "${status}"
+
+      - name: Upload merged results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            shards
+            bench-summary.md
+          if-no-files-found: warn
+          overwrite: true
