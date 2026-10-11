@@ -37,9 +37,9 @@ on:
         required: false
         default: ''
       trials:
-        description: 'Trials per series (>= 6 for significance at every thread count)'
+        description: 'Trials per series (>= 8 for significance at every thread count)'
         required: false
-        default: '7'
+        default: '8'
       duration_ms:
         description: 'Measured milliseconds per thread count'
         required: false
@@ -53,7 +53,7 @@ on:
         required: false
         default: '1000'
       seed:
-        description: 'Seed for the generated key sets. Table sizes depend on the keys, so a second seed separates a hash or resize effect from the luck of one key set'
+        description: 'First key seed; trial t generates its keys with seed + t, so a comparison spans as many key sets as trials'
         required: false
         default: '42'
       stress_seconds:
@@ -170,7 +170,7 @@ jobs:
       SHARDS: '4'
       SHARD: ${{ matrix.shard }}
       BASELINE_REF: ${{ inputs.baseline_ref || '' }}
-      TRIALS: ${{ inputs.trials || '7' }}
+      TRIALS: ${{ inputs.trials || '8' }}
       DURATION_MS: ${{ inputs.duration_ms || '1000' }}
       SCENARIOS: ${{ inputs.scenarios || 'all' }}
       LIVE: ${{ inputs.live || '1000' }}

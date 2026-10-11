@@ -11,14 +11,21 @@ Two kinds of comparison come out of one run:
   * candidate vs baseline when two --variant builds are given (first = candidate).
 BCL runs once per trial, from the candidate build, since both builds share the runtime.
 
-Ratios are reported as the ratio of medians. A row is called faster or slower only when an
-exact two-sided permutation test on the difference of mean log rates rejects "no difference" at
+Every trial generates its keys from its own seed (--seed plus the trial number), and every
+series in a trial uses that trial's keys. Table sizes and probe lengths depend on the keys, so a
+single key set can favour one build by luck; drawing one per trial makes the comparison span as
+many key sets as trials, and pairs the series of a trial on the same keys.
+
+Ratios are reported as the ratio of medians. A row is called faster or slower only when a
+two-sided sign-flip test on the per-trial differences of log rates rejects "no difference" at
 0.05 after Holm correction across the thread counts of that scenario, and the mean and the
 median point the same way; when they disagree, the row is reported as no clear difference.
-Permutation tests make no normality assumption, which matters at these sample sizes; with 3
-trials no row can reach significance, which is the honest outcome. Seven trials (the default)
-allow it. A row whose two series have different trial counts, after a failed process, is not
-tested: unequal splits reach small p-values that equal ones cannot.
+The test is exact, over all 2^trials sign patterns, while that count fits PERMUTATION_LIMIT
+(up to 14 trials); beyond that it estimates p from PERMUTATION_LIMIT random sign patterns.
+The test pairs the two series by trial, since a trial's series share a key set, and makes no
+normality assumption, which matters at these sample sizes. Its smallest p-value is 2 / 2^trials,
+so eight trials (the default) are needed for a label at every thread count of a four-count table.
+A row whose two series do not cover the same trials, after a failed process, is not tested.
 
 A run can be split into shards (--shard I/N) so that several runners measure in parallel.
 Scenarios are assigned in fixed groups (GROUPS) of tables that are read against each other,
@@ -84,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--threads", default="auto",
                    help="comma-separated counts, or 'auto' (powers of two up to the core count, the core count, "
                         "and 2x for oversubscription except in lookup-only scenarios)")
-    p.add_argument("--trials", type=int, default=7)
+    p.add_argument("--trials", type=int, default=8)
     p.add_argument("--warmup-ms", type=int, default=500)
     p.add_argument("--rewarm-ms", type=int, default=200,
                    help="warm-up for each thread count after the first in a process, once the code is compiled")
@@ -136,6 +143,9 @@ def parse_args() -> argparse.Namespace:
     args.scenario_list = shard_scenarios(requested, shard, shards)
     if args.trials < 2:
         p.error("--trials must be at least 2 to estimate spread")
+    # The harness parses --seed as a 32-bit int, and trial t passes seed + t.
+    if args.seed < -2**31 or args.seed + args.trials - 1 > 2**31 - 1:
+        p.error(f"--seed {args.seed} with {args.trials} trials leaves the 32-bit range the harness accepts")
     for name in ("warmup_ms", "rewarm_ms", "duration_ms"):
         if getattr(args, name) < 1:
             p.error(f"--{name.replace('_', '-')} must be positive")
@@ -276,7 +286,10 @@ def collect(args: argparse.Namespace) -> tuple[list[dict], dict, list[str]]:
                        "--threads", ",".join(map(str, threads)),
                        "--warmup-ms", str(args.warmup_ms), "--rewarm-ms", str(args.rewarm_ms),
                        "--duration-ms", str(args.duration_ms),
-                       "--size", str(args.size), "--live", str(args.live), "--seed", str(args.seed)]
+                       # Each trial draws its own key set, so a table size or probe pattern that one
+                       # set happens to give does not decide the comparison. Within a trial every
+                       # series uses the same keys.
+                       "--size", str(args.size), "--live", str(args.live), "--seed", str(args.seed + trial)]
                 started = time.monotonic()
                 try:
                     measured = run_process(cmd, timeout=process_seconds(scenario) * 4 + 120)
@@ -333,23 +346,26 @@ def mean_log_diff(a: list[float], b: list[float]) -> float:
     return statistics.fmean(math.log(x) for x in a) - statistics.fmean(math.log(x) for x in b)
 
 
+def smallest_p(trials: int) -> float:
+    """The smallest p-value permutation_p can return for this many paired trials."""
+    return 2 / 2 ** trials if 2 ** trials <= PERMUTATION_LIMIT else 1 / (PERMUTATION_LIMIT + 1)
+
+
 def permutation_p(a: list[float], b: list[float], rng: random.Random) -> float:
-    """Two-sided permutation test on the difference of mean log rates."""
-    la, lb = [math.log(x) for x in a], [math.log(x) for x in b]
-    pooled, n = la + lb, len(la)
-    observed = abs(statistics.fmean(la) - statistics.fmean(lb))
-    total = sum(pooled)
+    """Two-sided sign-flip test on the mean of paired log-rate differences; a[i] pairs with b[i]."""
+    d = [math.log(x) - math.log(y) for x, y in zip(a, b)]
+    n = len(d)
+    observed = abs(statistics.fmean(d))
 
-    def stat(idx: tuple[int, ...]) -> float:
-        sa = sum(pooled[i] for i in idx)
-        return abs(sa / n - (total - sa) / (len(pooled) - n))
+    def stat(signs) -> float:
+        return abs(sum(s * x for s, x in zip(signs, d)) / n)
 
-    if math.comb(len(pooled), n) <= PERMUTATION_LIMIT:
-        splits = list(itertools.combinations(range(len(pooled)), n))
-        hits = sum(1 for idx in splits if stat(idx) >= observed - 1e-12)
-        return hits / len(splits)
+    if 2 ** n <= PERMUTATION_LIMIT:
+        flips = list(itertools.product((1, -1), repeat=n))
+        hits = sum(1 for signs in flips if stat(signs) >= observed - 1e-12)
+        return hits / len(flips)
     hits = sum(1 for _ in range(PERMUTATION_LIMIT)
-               if stat(tuple(rng.sample(range(len(pooled)), n))) >= observed - 1e-12)
+               if stat([rng.choice((1, -1)) for _ in range(n)]) >= observed - 1e-12)
     return (hits + 1) / (PERMUTATION_LIMIT + 1)
 
 
@@ -408,16 +424,23 @@ def summarise(metas: list[dict], rows: list[dict], failures: list[str] | None = 
         lines.append(f"CPU: {machines[0]}.")
     lines.append(f"{cfg['trials']} trials per series, warm-up {cfg['warmup_ms']} ms for the first thread count "
                  f"and {cfg['rewarm_ms']} ms for later ones, measured {cfg['duration_ms']} ms, "
-                 f"size {cfg['size']:,}, churn live set {cfg['live']:,}, key seed {cfg['seed']}. Rates are medians in millions per second.")
-    lines.append("Ratios are ratios of medians. 'faster' or 'slower' only when an exact permutation test on "
-                 "mean log rates rejects no-difference at 0.05 after Holm correction across thread counts "
-                 "within the table and the mean agrees with the median on the direction; rows whose series "
-                 "have unequal trial counts are not tested.")
-    smallest_p = 2 / math.comb(2 * cfg["trials"], cfg["trials"])
+                 f"size {cfg['size']:,}, churn live set {cfg['live']:,}, key seeds {cfg['seed']} to {cfg['seed'] + cfg['trials'] - 1} "
+                 f"(one per trial). Rates and sizes are medians in millions per second and MB.")
+    exact = 2 ** cfg["trials"] <= PERMUTATION_LIMIT
+    test = "an exact sign-flip test" if exact else f"a sign-flip test estimated from {PERMUTATION_LIMIT:,} random sign patterns"
+    lines.append(f"Ratios are ratios of medians. 'faster' or 'slower' only when {test} on "
+                 "per-trial differences of log rates (series paired by trial, which share a key set) rejects "
+                 "no-difference at 0.05 after Holm correction across thread counts within the table and the "
+                 "mean agrees with the median on the direction; rows whose series do not cover the same "
+                 "trials are not tested.")
+    floor = smallest_p(cfg["trials"])
     widest = max((len(t) for t in threads_of.values()), default=1)
-    if smallest_p >= ALPHA / widest:
+    if floor >= ALPHA / widest:
+        needed = next((n for n in range(2, 64) if smallest_p(n) < ALPHA / widest), None)
+        advice = (f"Use at least {needed}." if needed is not None else
+                  f"No trial count helps while PERMUTATION_LIMIT is {PERMUTATION_LIMIT:,}; raise it.")
         lines.append(f"**Too few trials:** with {cfg['trials']} trials the smallest attainable p-value is "
-                     f"{smallest_p:.3f}, so no row can be called faster or slower. Use at least 6.")
+                     f"{floor:.2g}, so rows of the widest tables cannot all be called faster or slower. {advice}")
     if failures:
         lines.append(f"**{len(failures)} benchmark process(es) failed;** their series have fewer trials "
                      "and rows with no data are omitted:")
@@ -446,15 +469,17 @@ def summarise(metas: list[dict], rows: list[dict], failures: list[str] | None = 
         pairs = {"base": (cand, base), "bcl": (cand, bcl), "base_bcl": (base, bcl)}
         comparisons = {key: [] for key, (num, den) in pairs.items() if num and den}
         for threads in threads_of[scenario]:
-            series = {s: [r["ops_per_sec"] for r in by[(scenario, threads, s)]] for s in present}
+            by_trial = {s: {r["trial"]: r["ops_per_sec"] for r in by[(scenario, threads, s)]} for s in present}
+            series = {s: list(v.values()) for s, v in by_trial.items()}
             if not all(series.values()):
                 continue
             row = {"threads": threads, "series": series}
             for key in comparisons:
                 num, den = pairs[key]
                 ratio = statistics.median(series[num]) / statistics.median(series[den])
-                if len(series[num]) == len(series[den]):
-                    p = permutation_p(series[num], series[den], rng)
+                if by_trial[num].keys() == by_trial[den].keys():
+                    trials = sorted(by_trial[num])
+                    p = permutation_p([by_trial[num][t] for t in trials], [by_trial[den][t] for t in trials], rng)
                     if (mean_log_diff(series[num], series[den]) > 0) != (ratio > 1):
                         # Skewed trials: the tested mean and the reported median disagree on the
                         # direction, so no label would be honest.
@@ -462,7 +487,7 @@ def summarise(metas: list[dict], rows: list[dict], failures: list[str] | None = 
                 else:
                     # Not tested: see the module docstring. p = 1 keeps it out of the labels.
                     p = 1.0
-                    row[f"{key}_unequal"] = f"{len(series[num])} vs {len(series[den])} trials"
+                    row[f"{key}_unequal"] = f"different trials, {len(series[num])} vs {len(series[den])}"
                 comparisons[key].append((row, ratio, p))
             rows_out.append(row)
             notes.extend(scenario_notes(scenario, threads, by, present))
@@ -492,6 +517,17 @@ def summarise(metas: list[dict], rows: list[dict], failures: list[str] | None = 
     return "\n".join(lines)
 
 
+def median_with_range(values, fmt: str) -> str:
+    """The median, and the range when trials differ: table sizes come in powers of two, so key sets
+    split between two sizes and the median alone hides how often each occurred."""
+    values = list(values)
+    text = fmt.format(statistics.median(values))
+    lo, hi = min(values), max(values)
+    if fmt.format(lo) != fmt.format(hi):
+        text += f" (trials {fmt.format(lo)} to {fmt.format(hi)})"
+    return text
+
+
 def scenario_notes(scenario: str, threads: int, by: dict, series: list[str]) -> list[str]:
     notes = []
     for s in series:
@@ -503,18 +539,18 @@ def scenario_notes(scenario: str, threads: int, by: dict, series: list[str]) -> 
             if abs(ratio - expected) > (0.001 if expected == 1.0 else 0.02):
                 notes.append(f"- WARNING {s} at {threads} threads: hit ratio {ratio:.3f}, expected {expected:.3f}")
             if threads == min(t for (sc, t, _) in by if sc == scenario):
-                mb = statistics.median(r["extra"]["table_mb"] for r in rs)
-                notes.append(f"- {s}: filled map holds {mb:.1f} MB")
+                mb = median_with_range((r["extra"]["table_mb"] for r in rs), "{:.1f} MB")
+                notes.append(f"- {s}: filled map holds {mb}")
         elif scenario in ("churn-str", "churn-long", "churn-burst", "readd-str"):
-            mb = statistics.median(r["extra"]["retained_mb"] for r in rs)
+            mb = median_with_range((r["extra"]["retained_mb"] for r in rs), "{:.1f} MB")
             en = statistics.median(r["extra"]["post_churn_enumerate_ms"] for r in rs)
-            notes.append(f"- {s} at {threads} threads: retained {mb:.1f} MB growth over the run, "
+            notes.append(f"- {s} at {threads} threads: retained {mb} growth over the run, "
                          f"one enumeration afterwards {en:.2f} ms")
         elif scenario in ("insert-long-mirrored", "grow-int", "grow-str"):
             if threads == min(t for (sc, t, _) in by if sc == scenario):
-                mb = statistics.median(r["extra"]["table_mb"] for r in rs)
+                mb = median_with_range((r["extra"]["table_mb"] for r in rs), "{:.2f} MB")
                 n = int(rs[0]["extra"]["keys_per_table"])
-                notes.append(f"- {s}: one filled table of {n:,} keys holds {mb:.2f} MB")
+                notes.append(f"- {s}: one filled table of {n:,} keys holds {mb}")
         elif scenario == "enum-write" and threads > 1:
             w = statistics.median(r["extra"]["aux_per_sec"] for r in rs) / 1e6
             notes.append(f"- {s} at {threads} threads: writers sustained {w:.2f} M ops/s")
