@@ -90,6 +90,17 @@ namespace NonBlocking
                     object nextV = Volatile.Read(ref nextEntry.value);
                     if (nextV == null || nextV == TOMBSTONE)
                     {
+                        // A tombstone holds no value: a put of the same key reuses the slot, and a
+                        // copy turns it into TOMBPRIME before the key can appear in a newer table.
+                        continue;
+                    }
+
+                    if (nextV == TOMBPRIME && Volatile.Read(ref this._table._newTable) == null)
+                    {
+                        // TOMBPRIME with no resize in progress marks a removed key the sweeper is
+                        // retiring; a copy only writes it once a new table exists. The key may be
+                        // retired and added back in a later slot while this enumeration runs, so a
+                        // lookup from here could yield it a second time.
                         continue;
                     }
 
@@ -103,19 +114,37 @@ namespace NonBlocking
                     _curKey = _table.keyFromEntry(nextKstore);
                     if (nextV is Prime)
                     {
-                        // A copy writes TOMBPRIME over a slot with no value, which can be a slot an
-                        // insert has claimed by its hash but not yet given a key. Its key then reads
-                        // as the empty key: 0 for integer keys, which the lookup below would resolve
-                        // to a real key 0 stored elsewhere. The hash is written before the key, so a
-                        // key that does not match the slot's hash was never written to this slot.
-                        if (nextV == TOMBPRIME && nextEntry.hash != _table.hash(_curKey))
+                        if (nextV == TOMBPRIME)
                         {
-                            continue;
+                            // A copy writes TOMBPRIME over a slot with no value, which can be a slot an
+                            // insert has claimed by its hash but not yet given a key. Its key then reads
+                            // as the empty key: 0 for integer keys, which the lookup below would resolve
+                            // to a real key 0 stored elsewhere. The hash is written before the key, so a
+                            // key that does not match the slot's hash was never written to this slot.
+                            // The slot may also be retired by a sweep that started before this
+                            // enumeration and raced the resize. A retired slot gets a dead hash before
+                            // its key is cleared, and a key added back can only take a later slot once
+                            // that hash is visible, so the hash must still match after the lookup too.
+                            int keyHash = _table.hash(_curKey);
+                            if (nextEntry.hash != keyHash)
+                            {
+                                continue;
+                            }
+
+                            nextV = _table.TryGetValue(_curKey);
+                            Interlocked.MemoryBarrier();
+                            if (Volatile.Read(ref nextEntry.hash) != keyHash)
+                            {
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            // A copy is in progress: resolve through a lookup, which follows
+                            // forwarding to the newer table.
+                            nextV = _table.TryGetValue(_curKey);
                         }
 
-                        // A copy or sweep is in progress: resolve through a lookup, which follows
-                        // forwarding to the newer table.
-                        nextV = _table.TryGetValue(_curKey);
                         if (nextV == null)
                         {
                             continue;
