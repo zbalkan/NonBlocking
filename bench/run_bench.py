@@ -408,7 +408,7 @@ def summarise(metas: list[dict], rows: list[dict], failures: list[str] | None = 
         lines.append(f"CPU: {machines[0]}.")
     lines.append(f"{cfg['trials']} trials per series, warm-up {cfg['warmup_ms']} ms for the first thread count "
                  f"and {cfg['rewarm_ms']} ms for later ones, measured {cfg['duration_ms']} ms, "
-                 f"size {cfg['size']:,}, churn live set {cfg['live']:,}. Rates are medians in millions per second.")
+                 f"size {cfg['size']:,}, churn live set {cfg['live']:,}, key seed {cfg['seed']}. Rates are medians in millions per second.")
     lines.append("Ratios are ratios of medians. 'faster' or 'slower' only when an exact permutation test on "
                  "mean log rates rejects no-difference at 0.05 after Holm correction across thread counts "
                  "within the table and the mean agrees with the median on the direction; rows whose series "

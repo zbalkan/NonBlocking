@@ -52,6 +52,10 @@ on:
         description: 'Live keys per churn scenario (churn-str, churn-long; churn-burst swings to 100x)'
         required: false
         default: '1000'
+      seed:
+        description: 'Seed for the generated key sets. Table sizes depend on the keys, so a second seed separates a hash or resize effect from the luck of one key set'
+        required: false
+        default: '42'
       stress_seconds:
         description: 'Seconds per stress run'
         required: false
@@ -170,6 +174,7 @@ jobs:
       DURATION_MS: ${{ inputs.duration_ms || '1000' }}
       SCENARIOS: ${{ inputs.scenarios || 'all' }}
       LIVE: ${{ inputs.live || '1000' }}
+      SEED: ${{ inputs.seed || '42' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -204,7 +209,7 @@ jobs:
             variants+=(--variant base=out/base/NonBlocking.Bench.dll)
           fi
           python3 harness/bench/run_bench.py "${variants[@]}" --shard "${SHARD}/${SHARDS}" \
-            --trials "${TRIALS}" --duration-ms "${DURATION_MS}" --scenarios "${SCENARIOS}" --live "${LIVE}" \
+            --trials "${TRIALS}" --duration-ms "${DURATION_MS}" --scenarios "${SCENARIOS}" --live "${LIVE}" --seed "${SEED}" \
             --out bench-results.jsonl --summary bench-summary.md
 
       - name: Upload results
