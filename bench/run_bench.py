@@ -191,8 +191,41 @@ def available_cores() -> int:
     return len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
 
 
+def cpu_topology() -> str:
+    """Physical cores and threads per core, from sysfs. Hyperthreads share a core's execution
+    units, so a thread count above the physical core count measures something different."""
+    # Only the CPUs this process may run on, the same set available_cores() counts, so a
+    # cpuset-restricted runner reports what the benchmark can use rather than the host.
+    try:
+        allowed = os.sched_getaffinity(0)
+    except (AttributeError, OSError):
+        allowed = None
+    cores, logical = set(), 0
+    try:
+        for cpu in Path("/sys/devices/system/cpu").glob("cpu[0-9]*"):
+            topo = cpu / "topology"
+            if not topo.is_dir() or (allowed is not None and int(cpu.name[3:]) not in allowed):
+                continue
+            logical += 1
+            cores.add(((topo / "physical_package_id").read_text().strip(), (topo / "core_id").read_text().strip()))
+    except OSError:
+        return ""
+    if not cores:
+        return ""
+    per_core = logical // len(cores) if logical % len(cores) == 0 else f"{logical}/{len(cores)}"
+    return f"{len(cores)} physical core(s), {per_core} thread(s) per core"
+
+
 def machine_name() -> str:
-    """CPU model of this runner, so tables measured on different shards can be told apart."""
+    """CPU model and core topology of this runner, so tables measured on different shards can be
+    told apart."""
+    model = cpu_model()
+    topology = cpu_topology()
+    return f"{model} ({topology})" if topology else model
+
+
+def cpu_model() -> str:
+    """CPU model of this runner."""
     try:
         with open("/proc/cpuinfo", encoding="utf-8") as f:
             for line in f:
