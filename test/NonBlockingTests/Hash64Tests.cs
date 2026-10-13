@@ -61,18 +61,23 @@ namespace NonBlockingTests
             }
 
             var d = new NonBlocking.ConcurrentDictionary<nint, int>();
+            var u = new NonBlocking.ConcurrentDictionary<nuint, int>();
             for (int i = 1; i <= 2048; i++)
             {
                 Assert.True(d.TryAdd((nint)(((long)i << 32) | (uint)i), i));
+                Assert.True(u.TryAdd((nuint)(((ulong)i << 32) | (uint)i), i));
             }
 
             for (int i = 1; i <= 2048; i++)
             {
                 Assert.True(d.TryGetValue((nint)(((long)i << 32) | (uint)i), out int v));
                 Assert.Equal(i, v);
+                Assert.True(u.TryGetValue((nuint)(((ulong)i << 32) | (uint)i), out v));
+                Assert.Equal(i, v);
             }
 
             AssertTableAtMost(d, 16_384);
+            AssertTableAtMost(u, 16_384);
         }
 
         [Fact]
@@ -87,6 +92,11 @@ namespace NonBlockingTests
             }
 
             AssertAllPresent(d, i => ((long)i << 32) | (uint)i, 2048);
+            for (int i = 1; i <= 2048; i++)
+            {
+                Assert.True(u.TryGetValue(((ulong)i << 32) | (uint)i, out int v));
+                Assert.Equal(i, v);
+            }
             Assert.Equal(2048, u.Count);
             AssertTableAtMost(d, 16_384);
             AssertTableAtMost(u, 16_384);
@@ -148,76 +158,141 @@ namespace NonBlockingTests
         [Fact]
         public static void CustomComparerIsRespected()
         {
-            var comparer = new ModuloComparer(1000);
-            var d = new NonBlocking.ConcurrentDictionary<long, int>(comparer);
-            var u = new NonBlocking.ConcurrentDictionary<ulong, int>(new UnsignedModuloComparer(1000));
-            Assert.True(d.TryAdd(5, 1));
-            Assert.False(d.TryAdd(1005, 2));
-            Assert.True(d.TryGetValue(2005, out int v));
-            Assert.Equal(1, v);
-            Assert.True(u.TryAdd(5, 1));
-            Assert.False(u.TryAdd(1005, 2));
-            Assert.True(u.TryGetValue(2005, out v));
+            AssertCustomComparer<long>(i => i, k => (ulong)k);
+            AssertCustomComparer<ulong>(i => (ulong)i, k => k);
+            AssertCustomComparer<nint>(i => (nint)i, k => (ulong)k);
+            AssertCustomComparer<nuint>(i => (nuint)i, k => (ulong)k);
+        }
+
+        private static void AssertCustomComparer<TKey>(Func<int, TKey> key, Func<TKey, ulong> value)
+            where TKey : notnull
+        {
+            var comparer = new ModuloComparer<TKey>(value);
+            var d = new NonBlocking.ConcurrentDictionary<TKey, int>(comparer);
+            Assert.Same(comparer, d.Comparer);
+            Assert.True(d.TryAdd(key(5), 1));
+            Assert.False(d.TryAdd(key(1005), 2));
+            Assert.True(d.TryGetValue(key(2005), out int v));
             Assert.Equal(1, v);
             Assert.Equal(1, d.Count);
-            Assert.Equal(1, u.Count);
-            Assert.True(comparer.HashCalls > 0);
+
+            object initialTable = FindField(d.GetType(), "_table").GetValue(d);
+            // These distinct, nonzero remainders force a resize without equating any key to zero.
+            for (int i = 1; i <= 512; i++)
+            {
+                if (i != 5)
+                {
+                    Assert.True(d.TryAdd(key(i), i));
+                }
+            }
+
+            // Complete any pending copy and verify every entry through a comparer-equivalent key.
+            for (int i = 1; i <= 512; i++)
+            {
+                Assert.True(d.TryGetValue(key(i + 1000), out v));
+                Assert.Equal(i == 5 ? 1 : i, v);
+            }
+            Assert.NotSame(initialTable, FindField(d.GetType(), "_table").GetValue(d));
+            Assert.Same(comparer, d.Comparer);
+            int hashCalls = comparer.HashCalls;
+            Assert.True(d.TryGetValue(key(2005), out v));
+            Assert.Equal(1, v);
+            Assert.True(comparer.HashCalls > hashCalls);
+            Assert.True(d.TryUpdate(key(1005), 3, 1));
+            Assert.True(d.TryRemove(key(2005), out v));
+            Assert.Equal(3, v);
+            Assert.False(d.ContainsKey(key(5)));
+            Assert.True(d.TryAdd(key(1005), 4));
+            Assert.True(d.TryGetValue(key(5), out v));
+            Assert.Equal(4, v);
+
+            d.Clear();
+            Assert.Equal(0, d.Count);
+            Assert.Same(comparer, d.Comparer);
+            hashCalls = comparer.HashCalls;
+            Assert.True(d.TryAdd(key(5), 6));
+            Assert.False(d.TryAdd(key(1005), 7));
+            Assert.True(d.TryGetValue(key(2005), out v));
+            Assert.Equal(6, v);
+            Assert.True(comparer.HashCalls > hashCalls);
+            Assert.True(d.TryRemove(key(1005), out v));
+            Assert.Equal(6, v);
+            Assert.Equal(0, d.Count);
         }
 
-        private sealed class ModuloComparer : IEqualityComparer<long>
+        private sealed class ModuloComparer<TKey> : IEqualityComparer<TKey>
         {
-            private readonly long _m;
+            private readonly Func<TKey, ulong> _value;
             public int HashCalls;
 
-            public ModuloComparer(long m) => _m = m;
+            public ModuloComparer(Func<TKey, ulong> value) => _value = value;
 
-            public bool Equals(long x, long y) => x % _m == y % _m;
+            public bool Equals(TKey x, TKey y) => _value(x) % 1000 == _value(y) % 1000;
 
-            public int GetHashCode(long x)
+            public int GetHashCode(TKey key)
             {
                 HashCalls++;
-                return (int)(x % _m);
+                return (int)(_value(key) % 1000);
             }
         }
 
-        private sealed class UnsignedModuloComparer : IEqualityComparer<ulong>
-        {
-            private readonly ulong _m;
-
-            public UnsignedModuloComparer(ulong m) => _m = m;
-
-            public bool Equals(ulong x, ulong y) => x % _m == y % _m;
-
-            public int GetHashCode(ulong x) => (int)(x % _m);
-        }
-
-        [Fact]
-        public static void EdgeKeysRoundTrip()
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public static void EdgeKeysRoundTrip(bool explicitDefaultComparer)
         {
             long[] keys = { 0, 1, -1, 2, -2, 1L << 30, 1L << 31, 1L << 32, -(1L << 32), 1L << 62, long.MinValue, long.MaxValue };
-            var d = new NonBlocking.ConcurrentDictionary<long, long>();
-            var u = new NonBlocking.ConcurrentDictionary<ulong, long>();
-            foreach (long k in keys)
+            AssertEdgeKeysRoundTrip(keys, explicitDefaultComparer);
+            AssertEdgeKeysRoundTrip(Array.ConvertAll(keys, k => unchecked((ulong)k)), explicitDefaultComparer);
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public static void NativeIntEdgeKeysRoundTrip(bool explicitDefaultComparer)
+        {
+            // This test also runs on 32-bit processes; only use values representable at native width.
+            long[] signed = Environment.Is64BitProcess
+                ? new long[] { 0, 1, -1, 2, -2, 1L << 30, 1L << 31, 1L << 32, -(1L << 32), 1L << 62, long.MinValue, long.MaxValue }
+                : new long[] { 0, 1, -1, 2, -2, 1L << 30, int.MinValue, int.MaxValue };
+            ulong[] unsigned = Environment.Is64BitProcess
+                ? new ulong[] { 0, 1, 2, 1UL << 30, 1UL << 31, 1UL << 32, 1UL << 62, 1UL << 63, ulong.MaxValue }
+                : new ulong[] { 0, 1, 2, 1UL << 30, 1UL << 31, uint.MaxValue };
+            AssertEdgeKeysRoundTrip(Array.ConvertAll(signed, k => (nint)k), explicitDefaultComparer);
+            AssertEdgeKeysRoundTrip(Array.ConvertAll(unsigned, k => (nuint)k), explicitDefaultComparer);
+        }
+
+        private static void AssertEdgeKeysRoundTrip<TKey>(TKey[] keys, bool explicitDefaultComparer)
+            where TKey : notnull
+        {
+            var d = explicitDefaultComparer
+                ? new NonBlocking.ConcurrentDictionary<TKey, int>(EqualityComparer<TKey>.Default)
+                : new NonBlocking.ConcurrentDictionary<TKey, int>();
+            for (int i = 0; i < keys.Length; i++)
             {
-                Assert.True(d.TryAdd(k, k));
-                Assert.True(u.TryAdd(unchecked((ulong)k), k));
+                Assert.True(d.TryAdd(keys[i], i));
             }
 
-            foreach (long k in keys)
+            for (int i = 0; i < keys.Length; i++)
             {
-                Assert.True(d.TryGetValue(k, out long v));
-                Assert.Equal(k, v);
-                Assert.True(u.TryGetValue(unchecked((ulong)k), out v));
-                Assert.Equal(k, v);
-                Assert.True(d.TryRemove(k, out _));
-                Assert.False(d.ContainsKey(k));
-                Assert.True(d.TryAdd(k, ~k));
-                Assert.True(d.TryGetValue(k, out v));
-                Assert.Equal(~k, v);
+                Assert.True(d.TryGetValue(keys[i], out int v));
+                Assert.Equal(i, v);
+                Assert.True(d.TryUpdate(keys[i], ~i, i));
+                Assert.True(d.TryRemove(keys[i], out v));
+                Assert.Equal(~i, v);
+                Assert.False(d.ContainsKey(keys[i]));
+                Assert.True(d.TryAdd(keys[i], ~i));
+                Assert.True(d.TryGetValue(keys[i], out v));
+                Assert.Equal(~i, v);
             }
 
             Assert.Equal(keys.Length, d.Count);
-            Assert.Equal(keys.Length, u.Count);
+            // Later operations may have resized the table; recheck all earlier reinsertions.
+            for (int i = 0; i < keys.Length; i++)
+            {
+                Assert.True(d.TryGetValue(keys[i], out int v));
+                Assert.Equal(~i, v);
+            }
         }
 
         // The hash the dictionary's current table computes for a key.

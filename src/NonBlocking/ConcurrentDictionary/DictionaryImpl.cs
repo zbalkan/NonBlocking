@@ -51,6 +51,7 @@ namespace NonBlocking
         // only a few. Mixing in the high half rotated by 13 bits gives keys with equal halves distinct
         // hashes, spreads packed pairs, and moves bits 62 and 63 below the tag, which overwrites bits
         // 30 and 31. Keys below 2^32 keep the hash they have today.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         protected static int Hash64(long key)
         {
             uint high = (uint)(key >> 32);
